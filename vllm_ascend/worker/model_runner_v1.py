@@ -2951,12 +2951,25 @@ class NPUModelRunner(GPUModelRunner):
                             v_dim,
                         )
                     k_cache_dtype = v_cache_dtype = current_kv_cache_spec.dtype
+                    # C8 KV cache: force INT8 dtype for standard attention
+                    _c8_kv = getattr(self.ascend_config, 'enable_c8_kv', False)
+                    if _c8_kv:
+                        k_cache_dtype = v_cache_dtype = torch.int8
                     if self.is_kv_consumer and enable_fa_quant(self.vllm_config):
                         k_cache_dtype, v_cache_dtype = self.vllm_config.quant_config.get_kv_quant_dtype(
                             layer_name, current_kv_cache_spec.dtype, self.model_config
                         )
-                    k_cache = raw_k_tensor.view(k_cache_dtype).view(k_shape)
-                    v_cache = raw_v_tensor.view(v_cache_dtype).view(v_shape)
+                    if _c8_kv:
+                        # Raw buffer was allocated for bfloat16 (2 bytes/elem).
+                        # For INT8 (1 byte/elem), use only the first half.
+                        import math
+                        k_numel = math.prod(k_shape)
+                        v_numel = math.prod(v_shape)
+                        k_cache = raw_k_tensor[:k_numel].view(k_cache_dtype).view(k_shape)
+                        v_cache = raw_v_tensor[:v_numel].view(v_cache_dtype).view(v_shape)
+                    else:
+                        k_cache = raw_k_tensor.view(k_cache_dtype).view(k_shape)
+                        v_cache = raw_v_tensor.view(v_cache_dtype).view(v_shape)
 
                     if self.use_sparse:
                         dsa_k_cache_shape = (

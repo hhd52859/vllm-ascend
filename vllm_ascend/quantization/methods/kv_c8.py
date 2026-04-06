@@ -2,6 +2,8 @@ import torch
 from vllm.config import get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 
+from .base import AscendAttentionScheme
+from .base import AscendAttentionScheme
 from .registry import register_scheme
 
 
@@ -87,3 +89,105 @@ class AscendSFAQuantAttentionMethod:
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         pass
+
+
+def _c8_kv_scale_weight_loader(param: torch.nn.Parameter, loaded_weight: torch.Tensor) -> None:
+    """Weight loader for dense-attention C8 KV cache scales/offsets."""
+    loaded_weight = loaded_weight.squeeze()
+    if param.data.shape != loaded_weight.shape:
+        param.data = loaded_weight.to(param.dtype).clone()
+    else:
+        param.data.copy_(loaded_weight)
+
+
+class AscendC8KVCacheAttentionMethod(AscendAttentionScheme):
+    """C8 INT8 KV cache quantization for dense-attention models (e.g. Qwen3, MiniMax M2.5).
+
+    Reads static per-channel scales (k_cache_scale/offset, v_cache_scale/offset)
+    from the pre-calibrated checkpoint and uses key_antiquant_mode=0 (per-channel)
+    with BNSD layout for decode.  For prefill, dequantizes the paged INT8 KV to float.
+    """
+
+    def __init__(self, quant_description: dict, prefix: str):
+        self.quant_description = quant_description
+        self.prefix = prefix
+
+    def create_weights(self, layer: torch.nn.Module) -> None:
+        # Force INT8 KV cache allocation.
+        layer.kv_cache_torch_dtype = torch.int8
+        # Upgrade impl to the C8-specific subclass.
+        if hasattr(layer, "impl"):
+            from vllm_ascend.attention.attention_v1 import AscendC8AttentionBackendImpl
+            layer.impl.__class__ = AscendC8AttentionBackendImpl
+        layer.k_cache_scale = torch.nn.Parameter(torch.ones(1, dtype=torch.float32), requires_grad=False)
+        layer.k_cache_scale.weight_loader = _c8_kv_scale_weight_loader
+        layer.k_cache_offset = torch.nn.Parameter(torch.zeros(1, dtype=torch.float32), requires_grad=False)
+        layer.k_cache_offset.weight_loader = _c8_kv_scale_weight_loader
+        layer.v_cache_scale = torch.nn.Parameter(torch.ones(1, dtype=torch.float32), requires_grad=False)
+        layer.v_cache_scale.weight_loader = _c8_kv_scale_weight_loader
+        layer.v_cache_offset = torch.nn.Parameter(torch.zeros(1, dtype=torch.float32), requires_grad=False)
+        layer.v_cache_offset.weight_loader = _c8_kv_scale_weight_loader
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer.k_cache_scale.data = layer.k_cache_scale.data.flatten()
+        layer.k_cache_offset.data = layer.k_cache_offset.data.flatten()
+        layer.v_cache_scale.data = layer.v_cache_scale.data.flatten()
+        layer.v_cache_offset.data = layer.v_cache_offset.data.flatten()
+
+    def apply(self, layer, query, key, value, kv_cache, attn_metadata,
+              attn_type, scale, output) -> torch.Tensor:
+        raise RuntimeError(
+            "AscendC8KVCacheAttentionMethod.apply should not be called. "
+            "C8 KV cache quantization is handled by the attention backend."
+        )
+
+
+def _c8_kv_scale_weight_loader(param: torch.nn.Parameter, loaded_weight: torch.Tensor) -> None:
+    """Weight loader for dense-attention C8 KV cache scales/offsets."""
+    loaded_weight = loaded_weight.squeeze()
+    if param.data.shape != loaded_weight.shape:
+        param.data = loaded_weight.to(param.dtype).clone()
+    else:
+        param.data.copy_(loaded_weight)
+
+
+class AscendC8KVCacheAttentionMethod(AscendAttentionScheme):
+    """C8 INT8 KV cache quantization for dense-attention models (e.g. Qwen3, MiniMax M2.5).
+
+    Reads static per-channel scales (k_cache_scale/offset, v_cache_scale/offset)
+    from the pre-calibrated checkpoint and uses key_antiquant_mode=0 (per-channel)
+    with BNSD layout for decode.  For prefill, dequantizes the paged INT8 KV to float.
+    """
+
+    def __init__(self, quant_description: dict, prefix: str):
+        self.quant_description = quant_description
+        self.prefix = prefix
+
+    def create_weights(self, layer: torch.nn.Module) -> None:
+        # Force INT8 KV cache allocation.
+        layer.kv_cache_torch_dtype = torch.int8
+        # Upgrade impl to the C8-specific subclass.
+        if hasattr(layer, "impl"):
+            from vllm_ascend.attention.attention_v1 import AscendC8AttentionBackendImpl
+            layer.impl.__class__ = AscendC8AttentionBackendImpl
+        layer.k_cache_scale = torch.nn.Parameter(torch.ones(1, dtype=torch.float32), requires_grad=False)
+        layer.k_cache_scale.weight_loader = _c8_kv_scale_weight_loader
+        layer.k_cache_offset = torch.nn.Parameter(torch.zeros(1, dtype=torch.float32), requires_grad=False)
+        layer.k_cache_offset.weight_loader = _c8_kv_scale_weight_loader
+        layer.v_cache_scale = torch.nn.Parameter(torch.ones(1, dtype=torch.float32), requires_grad=False)
+        layer.v_cache_scale.weight_loader = _c8_kv_scale_weight_loader
+        layer.v_cache_offset = torch.nn.Parameter(torch.zeros(1, dtype=torch.float32), requires_grad=False)
+        layer.v_cache_offset.weight_loader = _c8_kv_scale_weight_loader
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer.k_cache_scale.data = layer.k_cache_scale.data.flatten()
+        layer.k_cache_offset.data = layer.k_cache_offset.data.flatten()
+        layer.v_cache_scale.data = layer.v_cache_scale.data.flatten()
+        layer.v_cache_offset.data = layer.v_cache_offset.data.flatten()
+
+    def apply(self, layer, query, key, value, kv_cache, attn_metadata,
+              attn_type, scale, output) -> torch.Tensor:
+        raise RuntimeError(
+            "AscendC8KVCacheAttentionMethod.apply should not be called. "
+            "C8 KV cache quantization is handled by the attention backend."
+        )

@@ -159,6 +159,9 @@ class AscendConfig:
             and get_ascend_device_type() != AscendDeviceType.A5
         )
 
+        # Enable C8 (INT8) KV cache for standard (non-MLA) attention models
+        self.enable_c8_kv = additional_config.get("enable_c8_kv", False)
+
         self.enable_sp_by_pass = (
             vllm_config.model_config is not None
             and not vllm_config.model_config.enforce_eager

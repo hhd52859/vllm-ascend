@@ -22,6 +22,7 @@ import torch
 import torch_npu
 import vllm.envs as envs_vllm
 from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (  # type: ignore
     AttentionBackend,
@@ -977,4 +978,334 @@ class AscendAttentionBackendImpl(AttentionImpl):
         else:
             attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output)
         output[:num_tokens] = attn_output[:num_tokens]
+        return output
+
+
+class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
+    """Attention backend for static per-channel INT8 KV cache (C8 pre-calibrated).
+
+    Activated via class surgery in AscendC8KVCacheAttentionMethod.create_weights
+    (vllm_ascend/quantization/methods/kv_c8.py) when kv_cache_type == "C8".
+    Uses key_antiquant_mode=0 (per-channel) with BNSD layout for decode,
+    and falls back to float KV (dequantized from paged cache) for prefill.
+    """
+
+    def forward(
+        self,
+        layer,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache,
+        attn_metadata,
+        output: torch.Tensor | None = None,
+        output_scale: torch.Tensor | None = None,
+        output_block_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        assert output is not None, "Output tensor must be provided."
+        if output_scale is not None or output_block_scale is not None:
+            raise NotImplementedError("fused output quantization not supported for AscendC8AttentionBackendImpl")
+
+        num_tokens = query.shape[0]
+        if attn_metadata is None:
+            return output.fill_(0)
+
+        float_key, float_value = None, None
+        if key is not None and value is not None:
+            if attn_metadata.attn_state != AscendAttentionState.DecodeOnly:
+                float_key, float_value = key, value
+            key, value = self._quantize_kv_to_int8(key, value, layer, attn_metadata.num_actual_tokens)
+            query, key, value, _ = self.reshape_and_cache(query, key, value, kv_cache, attn_metadata, output)
+
+        if attn_metadata.model_runner_type == "pooling":
+            attn_output = self._forward_encoder_attention(query, key, value, attn_metadata, output)
+            output[:num_tokens] = attn_output[:num_tokens]
+            return output
+
+        self._prepare_c8_scales(layer, query.device)
+        if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
+            return self._forward_c8_decode(query, attn_metadata, output, layer)
+        elif attn_metadata.attn_state == AscendAttentionState.ChunkedPrefill:
+            return self._forward_c8_chunked_prefill(query, float_key, float_value, attn_metadata, output, layer)
+        else:
+            return self._forward_c8_fused_infer_attention(
+                query,
+                float_key if float_key is not None else key,
+                float_value if float_value is not None else value,
+                attn_metadata,
+                output,
+                layer,
+            )
+
+    def _prepare_c8_scales(self, layer, device: torch.device) -> None:
+        """Shard per-channel C8 scales/offsets to this TP rank and pre-compute
+        BF16 BNSD antiquant tensors for the decode fast path.
+        """
+        if getattr(layer, "_c8_scales_prepared", False):
+            return
+
+        def _shard_and_reshape(raw: torch.Tensor) -> torch.Tensor:
+            if raw.numel() == 1:
+                return raw.to(device=device)
+            expected = self.num_kv_heads * self.head_size
+            if raw.numel() != expected:
+                total_kv_heads = raw.numel() // self.head_size
+                tp_rank = get_tensor_model_parallel_rank()
+                tp_size = get_tensor_model_parallel_world_size()
+                kv_head_start = tp_rank * total_kv_heads // tp_size
+                raw = raw.view(total_kv_heads, self.head_size)[
+                    kv_head_start: kv_head_start + self.num_kv_heads
+                ].contiguous()
+            return raw.view(1, self.num_kv_heads, self.head_size).to(device=device)
+
+        layer._c8_k_scale = _shard_and_reshape(layer.k_cache_scale.data)
+        layer._c8_k_offset = _shard_and_reshape(layer.k_cache_offset.data)
+        layer._c8_v_scale = _shard_and_reshape(layer.v_cache_scale.data)
+        layer._c8_v_offset = _shard_and_reshape(layer.v_cache_offset.data)
+
+        bnsd = (1, self.num_kv_heads, 1, self.head_size)
+        layer._c8_k_aq_scale = layer._c8_k_scale.to(torch.bfloat16).view(bnsd).contiguous()
+        layer._c8_k_aq_offset = layer._c8_k_offset.to(torch.bfloat16).view(bnsd).contiguous()
+        layer._c8_v_aq_scale = layer._c8_v_scale.to(torch.bfloat16).view(bnsd).contiguous()
+        layer._c8_v_aq_offset = layer._c8_v_offset.to(torch.bfloat16).view(bnsd).contiguous()
+
+        layer._c8_k_inv_scale_bf16 = (1.0 / layer._c8_k_scale).to(torch.bfloat16)
+        layer._c8_k_offset_bf16 = layer._c8_k_offset.to(torch.bfloat16)
+        layer._c8_v_inv_scale_bf16 = (1.0 / layer._c8_v_scale).to(torch.bfloat16)
+        layer._c8_v_offset_bf16 = layer._c8_v_offset.to(torch.bfloat16)
+
+        layer._c8_scales_prepared = True
+
+    def _quantize_kv_to_int8(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        layer,
+        num_actual_tokens: int,
+    ):
+        """Quantize K/V from float to INT8 using static per-channel C8 scales."""
+        self._prepare_c8_scales(layer, key.device)
+        actual_key = key[:num_actual_tokens]
+        actual_value = value[:num_actual_tokens]
+        k_int8 = torch.clamp(
+            torch.round(actual_key * layer._c8_k_inv_scale_bf16 + layer._c8_k_offset_bf16),
+            -128, 127,
+        ).to(torch.int8)
+        v_int8 = torch.clamp(
+            torch.round(actual_value * layer._c8_v_inv_scale_bf16 + layer._c8_v_offset_bf16),
+            -128, 127,
+        ).to(torch.int8)
+        return k_int8, v_int8
+
+    def _dequant_paged_kv_to_dense(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens,
+        target_dtype: torch.dtype,
+        layer,
+    ):
+        """Gather paged INT8 KV blocks and dequantize to target_dtype."""
+        batch_size = block_table.shape[0]
+        block_size = key.shape[1]
+        H = key.shape[2]
+        max_blocks_per_seq = block_table.shape[1]
+        max_tokens_padded = max_blocks_per_seq * block_size
+
+        flat_ids = block_table.reshape(-1)
+        gathered_k = key[flat_ids].view(batch_size, max_tokens_padded, H)
+        gathered_v = value[flat_ids].view(batch_size, max_tokens_padded, H)
+
+        seq_lens_t = torch.tensor(seq_lens, dtype=torch.long, device=key.device)
+        positions = torch.arange(max_tokens_padded, dtype=torch.long, device=key.device)
+        valid_mask = (positions.unsqueeze(0) < seq_lens_t.unsqueeze(1)).view(-1)
+
+        dense_k = gathered_k.view(-1, H)[valid_mask].view(-1, self.num_kv_heads, self.head_size)
+        dense_v = gathered_v.view(-1, H)[valid_mask].view(-1, self.num_kv_heads, self.head_size)
+
+        k_scale = layer._c8_k_scale.to(target_dtype)
+        k_offset = layer._c8_k_offset.to(target_dtype)
+        v_scale = layer._c8_v_scale.to(target_dtype)
+        v_offset = layer._c8_v_offset.to(target_dtype)
+        dense_k = (dense_k.to(target_dtype) - k_offset) * k_scale
+        dense_v = (dense_v.to(target_dtype) - v_offset) * v_scale
+        return dense_k, dense_v
+
+    def _forward_c8_decode(self, query: torch.Tensor, attn_metadata, output: torch.Tensor, layer) -> torch.Tensor:
+        """C8 decode: FIA BNSD with native paged INT8 KV + per-channel antiquant (mode=0)."""
+        num_block, block_size, _, _ = self.key_cache.shape
+        assert block_size % 32 == 0, f"C8 INT8 KV requires block_size multiple of 32, got {block_size}"
+        kv_k = self.key_cache.view(num_block, block_size, -1)
+        kv_v = self.value_cache.view(num_block, block_size, -1)
+        batch_size = len(attn_metadata.seq_lens_list)
+
+        attn_output, _ = torch_npu.npu_fused_infer_attention_score(
+            query[:batch_size].unsqueeze(2),
+            kv_k,
+            kv_v,
+            key_antiquant_scale=layer._c8_k_aq_scale.to(query.dtype) if layer._c8_k_aq_scale.dtype != query.dtype else layer._c8_k_aq_scale,
+            key_antiquant_offset=layer._c8_k_aq_offset.to(query.dtype) if layer._c8_k_aq_offset.dtype != query.dtype else layer._c8_k_aq_offset,
+            value_antiquant_scale=layer._c8_v_aq_scale.to(query.dtype) if layer._c8_v_aq_scale.dtype != query.dtype else layer._c8_v_aq_scale,
+            value_antiquant_offset=layer._c8_v_aq_offset.to(query.dtype) if layer._c8_v_aq_offset.dtype != query.dtype else layer._c8_v_aq_offset,
+            block_table=attn_metadata.block_tables,
+            actual_seq_lengths_kv=attn_metadata.seq_lens_list,
+            num_heads=self.num_heads,
+            num_key_value_heads=self.num_kv_heads,
+            input_layout="BNSD",
+            scale=self.scale,
+            block_size=block_size,
+            key_antiquant_mode=0,   # per-channel
+            value_antiquant_mode=0,
+            sparse_mode=0,
+        )
+        output[:batch_size] = attn_output.squeeze(2)
+        return output
+
+    def _forward_c8_chunked_prefill(
+        self,
+        query: torch.Tensor,
+        float_key,
+        float_value,
+        attn_metadata,
+        output: torch.Tensor,
+        layer,
+    ) -> torch.Tensor:
+        """C8 ChunkedPrefill: decode via BNSD paged INT8, prefill via TND float KV."""
+        num_decode_tokens = attn_metadata.num_decode_tokens
+        num_decodes = attn_metadata.num_decodes
+        actual_seq_qlen = attn_metadata.actual_seq_lengths_q
+        num_tokens = int(actual_seq_qlen[-1])
+
+        if num_decode_tokens > 0:
+            num_block, block_size, _, _ = self.key_cache.shape
+            assert block_size % 32 == 0, f"C8 INT8 KV requires block_size multiple of 32, got {block_size}"
+            kv_k = self.key_cache.view(num_block, block_size, -1)
+            kv_v = self.value_cache.view(num_block, block_size, -1)
+
+            attn_out, _ = torch_npu.npu_fused_infer_attention_score(
+                query[:num_decode_tokens].unsqueeze(2),
+                kv_k,
+                kv_v,
+                key_antiquant_scale=layer._c8_k_aq_scale.to(query.dtype) if layer._c8_k_aq_scale.dtype != query.dtype else layer._c8_k_aq_scale,
+                key_antiquant_offset=layer._c8_k_aq_offset.to(query.dtype) if layer._c8_k_aq_offset.dtype != query.dtype else layer._c8_k_aq_offset,
+                value_antiquant_scale=layer._c8_v_aq_scale.to(query.dtype) if layer._c8_v_aq_scale.dtype != query.dtype else layer._c8_v_aq_scale,
+                value_antiquant_offset=layer._c8_v_aq_offset.to(query.dtype) if layer._c8_v_aq_offset.dtype != query.dtype else layer._c8_v_aq_offset,
+                block_table=attn_metadata.block_tables[:num_decodes],
+                actual_seq_lengths_kv=attn_metadata.seq_lens_list[:num_decodes],
+                num_heads=self.num_heads,
+                num_key_value_heads=self.num_kv_heads,
+                input_layout="BNSD",
+                scale=self.scale,
+                block_size=block_size,
+                key_antiquant_mode=0,
+                value_antiquant_mode=0,
+                sparse_mode=0,
+            )
+            output[:num_decode_tokens] = attn_out.squeeze(2)
+
+        if attn_metadata.num_prefills > 0:
+            prefill_q = query[num_decode_tokens:num_tokens]
+            prefill_seq_qlen = [
+                actual_seq_qlen[i] - num_decode_tokens
+                for i in range(num_decodes, len(actual_seq_qlen))
+            ]
+
+            # Use float KV if all sequences are new (no cached KV to dequant)
+            all_new_prefill = all(
+                attn_metadata.seq_lens_list[i] <= (actual_seq_qlen[i] - (actual_seq_qlen[i-1] if i > 0 else 0))
+                for i in range(num_decodes, len(attn_metadata.seq_lens_list))
+            )
+            if all_new_prefill and float_key is not None and float_value is not None:
+                prefill_k = float_key[num_decode_tokens:num_tokens]
+                prefill_v = float_value[num_decode_tokens:num_tokens]
+                prefill_seq_kvlen = prefill_seq_qlen
+            else:
+                num_block, blk_size, _, _ = self.key_cache.shape
+                paged_k = self.key_cache.view(num_block, blk_size, -1)
+                paged_v = self.value_cache.view(num_block, blk_size, -1)
+                prefill_bt = attn_metadata.block_tables[num_decodes:]
+                prefill_sl = attn_metadata.seq_lens_list[num_decodes:]
+                prefill_k, prefill_v = self._dequant_paged_kv_to_dense(
+                    paged_k, paged_v, prefill_bt, prefill_sl, query.dtype, layer
+                )
+                prefill_seq_kvlen = torch.tensor(prefill_sl, dtype=torch.int32).cumsum(dim=0)
+
+            cache_block_size = self.key_cache.shape[1]
+            attn_out, _ = torch_npu.npu_fused_infer_attention_score(
+                query=prefill_q,
+                key=prefill_k,
+                value=prefill_v,
+                atten_mask=attn_metadata.attn_mask,
+                block_table=None,
+                input_layout="TND",
+                block_size=cache_block_size,
+                actual_seq_lengths=prefill_seq_qlen,
+                actual_seq_lengths_kv=prefill_seq_kvlen,
+                num_key_value_heads=self.num_kv_heads,
+                num_heads=self.num_heads,
+                scale=self.scale,
+                sparse_mode=3,
+            )
+            n_prefill = num_tokens - num_decode_tokens
+            output[num_decode_tokens:num_tokens] = attn_out.view(n_prefill, self.num_heads, self.head_size)
+
+        return output
+
+    def _forward_c8_fused_infer_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata,
+        output: torch.Tensor,
+        layer,
+    ) -> torch.Tensor:
+        """C8 prefill: TND layout, dequantize paged INT8 KV if needed."""
+        key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(key, value, attn_metadata)
+
+        actual_seq_qlen = attn_metadata.actual_seq_lengths_q
+        num_tokens = int(actual_seq_qlen[-1])
+        query = query[:num_tokens]
+
+        if (
+            attn_metadata.attn_state == AscendAttentionState.PrefillNoCache
+            and self.attn_type != AttentionType.ENCODER_DECODER
+        ):
+            key = key[:num_tokens]
+            value = value[:num_tokens]
+
+        if key.dtype == torch.int8:
+            if block_table is not None:
+                seq_lens = (
+                    actual_seq_lengths_kv
+                    if isinstance(actual_seq_lengths_kv, list)
+                    else actual_seq_lengths_kv.tolist()
+                )
+                key, value = self._dequant_paged_kv_to_dense(key, value, block_table, seq_lens, query.dtype, layer)
+                block_table = None
+                block_size = self.key_cache.shape[1]
+                actual_seq_lengths_kv = torch.tensor(seq_lens, dtype=torch.int32).cumsum(dim=0)
+            else:
+                qdt = query.dtype
+                key = (key.to(qdt) - layer._c8_k_offset.to(qdt)) * layer._c8_k_scale.to(qdt)
+                value = (value.to(qdt) - layer._c8_v_offset.to(qdt)) * layer._c8_v_scale.to(qdt)
+
+        attn_output, _ = torch_npu.npu_fused_infer_attention_score(
+            query=query,
+            key=key,
+            value=value,
+            atten_mask=attn_metadata.attn_mask,
+            block_table=block_table,
+            input_layout="TND",
+            block_size=block_size,
+            actual_seq_lengths=actual_seq_qlen,
+            actual_seq_lengths_kv=actual_seq_lengths_kv,
+            num_key_value_heads=self.num_kv_heads,
+            num_heads=self.num_heads,
+            scale=self.scale,
+            sparse_mode=3,
+        )
+        attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
+        output[:num_tokens] = attn_output
         return output
