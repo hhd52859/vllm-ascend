@@ -131,6 +131,19 @@ class AscendAttentionBackend(AttentionBackend):
         return [128]
 
 
+class AscendC8AttentionBackend(AscendAttentionBackend):
+    """Dedicated backend class for C8 KV cache decode.
+
+    Full-graph attention update dispatch uses backend.get_impl_cls() rather than
+    the runtime type of layer.impl, so C8 cannot rely on impl class surgery
+    alone when FULL_DECODE_ONLY is enabled.
+    """
+
+    @staticmethod
+    def get_impl_cls() -> type["AscendC8AttentionBackendImpl"]:
+        return AscendC8AttentionBackendImpl
+
+
 class AscendAttentionState(Enum):
     PrefillNoCache = 0
     PrefillCacheHit = 1
@@ -990,6 +1003,88 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
     and falls back to float KV (dequantized from paged cache) for prefill.
     """
 
+    @staticmethod
+    def update_graph_params(
+        update_stream,
+        forward_context,
+        num_tokens,
+        vllm_config,
+        speculative_config=None,
+        num_dcp_pcp_tokens=None,
+        draft_attn_metadatas=None,
+    ):
+        if _EXTRA_CTX.is_draft_model:
+            graph_params = get_draft_graph_params()
+            attn_metadata = draft_attn_metadatas
+            attn_keys = list(attn_metadata[0].keys())
+        else:
+            graph_params = get_graph_params()
+            attn_metadata = forward_context.attn_metadata
+            attn_keys = list(attn_metadata.keys())
+
+        num_layers = len(attn_keys)
+        if num_layers == 0:
+            return
+        if _EXTRA_CTX.is_draft_model:
+            attn_keys = attn_keys * (len(graph_params.attn_params[num_tokens]) // num_layers)
+
+        attn_count = 0
+        with torch.npu.stream(update_stream):
+            for key, param, handle, event in zip(
+                attn_keys,
+                graph_params.attn_params[num_tokens],
+                graph_params.handles[num_tokens],
+                graph_params.events[num_tokens],
+            ):
+                (
+                    query,
+                    key_cache,
+                    value_cache,
+                    block_table,
+                    num_kv_heads,
+                    num_heads,
+                    scale,
+                    output,
+                    softmax_lse,
+                    block_size,
+                    key_antiquant_scale,
+                    key_antiquant_offset,
+                    value_antiquant_scale,
+                    value_antiquant_offset,
+                ) = param
+
+                if _EXTRA_CTX.is_draft_model:
+                    draft_step = attn_count // num_layers
+                    seq_lens_list = attn_metadata[draft_step][key].seq_lens_list
+                    attn_count += 1
+                else:
+                    seq_lens_list = attn_metadata[key].seq_lens_list
+
+                batch_size = len(seq_lens_list)
+                torch.npu.graph_task_update_begin(update_stream, handle)
+                torch_npu.npu_fused_infer_attention_score.out(
+                    query=query[:batch_size].unsqueeze(2),
+                    key=key_cache,
+                    value=value_cache,
+                    key_antiquant_scale=key_antiquant_scale,
+                    key_antiquant_offset=key_antiquant_offset,
+                    value_antiquant_scale=value_antiquant_scale,
+                    value_antiquant_offset=value_antiquant_offset,
+                    block_table=block_table,
+                    actual_seq_lengths_kv=seq_lens_list,
+                    num_heads=num_heads,
+                    num_key_value_heads=num_kv_heads,
+                    input_layout="BNSD",
+                    scale=scale,
+                    block_size=block_size,
+                    key_antiquant_mode=0,
+                    value_antiquant_mode=0,
+                    sparse_mode=0,
+                    out=[output[:batch_size].unsqueeze(2), softmax_lse],
+                )
+                torch.npu.graph_task_update_end(update_stream)
+                event.record(update_stream)
+
     def forward(
         self,
         layer,
@@ -1023,6 +1118,8 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
             return output
 
         self._prepare_c8_scales(layer, query.device)
+        if _EXTRA_CTX.capturing and attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
+            return self._full_graph_c8_decode(query, attn_metadata, output, layer)
         if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
             return self._forward_c8_decode(query, attn_metadata, output, layer)
         elif attn_metadata.attn_state == AscendAttentionState.ChunkedPrefill:
@@ -1131,6 +1228,91 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
         dense_k = (dense_k.to(target_dtype) - k_offset) * k_scale
         dense_v = (dense_v.to(target_dtype) - v_offset) * v_scale
         return dense_k, dense_v
+
+    def _full_graph_c8_decode(self, query: torch.Tensor, attn_metadata, output: torch.Tensor, layer) -> torch.Tensor:
+        """Capture C8 decode as a graph task and replay it via update_graph_params."""
+        graph_params = get_draft_graph_params() if _EXTRA_CTX.is_draft_model else get_graph_params()
+        num_tokens = query.shape[0]
+        num_block, block_size, _, _ = self.key_cache.shape
+        assert block_size % 32 == 0, f"C8 INT8 KV requires block_size multiple of 32, got {block_size}"
+
+        kv_k = self.key_cache.view(num_block, block_size, -1)
+        kv_v = self.value_cache.view(num_block, block_size, -1)
+        batch_size = len(attn_metadata.seq_lens_list)
+        query_bnsd = query[:batch_size].unsqueeze(2)
+        output_bnsd = output[:batch_size].unsqueeze(2)
+        softmax_lse = torch.empty(1, dtype=query.dtype, device=query.device)
+
+        key_antiquant_scale = (
+            layer._c8_k_aq_scale.to(query.dtype)
+            if layer._c8_k_aq_scale.dtype != query.dtype
+            else layer._c8_k_aq_scale
+        )
+        key_antiquant_offset = (
+            layer._c8_k_aq_offset.to(query.dtype)
+            if layer._c8_k_aq_offset.dtype != query.dtype
+            else layer._c8_k_aq_offset
+        )
+        value_antiquant_scale = (
+            layer._c8_v_aq_scale.to(query.dtype)
+            if layer._c8_v_aq_scale.dtype != query.dtype
+            else layer._c8_v_aq_scale
+        )
+        value_antiquant_offset = (
+            layer._c8_v_aq_offset.to(query.dtype)
+            if layer._c8_v_aq_offset.dtype != query.dtype
+            else layer._c8_v_aq_offset
+        )
+
+        stream = torch_npu.npu.current_stream()
+        event = torch.npu.ExternalEvent()
+        event.wait(stream)
+        event.reset(stream)
+        graph_params.events[num_tokens].append(event)
+        graph_params.attn_params[num_tokens].append(
+            (
+                weak_ref_tensors(query),
+                weak_ref_tensors(kv_k),
+                weak_ref_tensors(kv_v),
+                weak_ref_tensors(attn_metadata.block_tables),
+                self.num_kv_heads,
+                self.num_heads,
+                self.scale,
+                weak_ref_tensors(output),
+                weak_ref_tensors(softmax_lse),
+                block_size,
+                weak_ref_tensors(key_antiquant_scale),
+                weak_ref_tensors(key_antiquant_offset),
+                weak_ref_tensors(value_antiquant_scale),
+                weak_ref_tensors(value_antiquant_offset),
+            )
+        )
+
+        torch.npu.graph_task_group_begin(stream)
+        torch_npu.npu_fused_infer_attention_score.out(
+            query=query_bnsd,
+            key=kv_k,
+            value=kv_v,
+            key_antiquant_scale=key_antiquant_scale,
+            key_antiquant_offset=key_antiquant_offset,
+            value_antiquant_scale=value_antiquant_scale,
+            value_antiquant_offset=value_antiquant_offset,
+            block_table=attn_metadata.block_tables,
+            actual_seq_lengths_kv=attn_metadata.seq_lens_list,
+            num_heads=self.num_heads,
+            num_key_value_heads=self.num_kv_heads,
+            input_layout="BNSD",
+            scale=self.scale,
+            block_size=block_size,
+            key_antiquant_mode=0,
+            value_antiquant_mode=0,
+            sparse_mode=0,
+            out=[output_bnsd, softmax_lse],
+        )
+
+        handle = torch.npu.graph_task_group_end(stream)
+        graph_params.handles[num_tokens].append(handle)
+        return output
 
     def _forward_c8_decode(self, query: torch.Tensor, attn_metadata, output: torch.Tensor, layer) -> torch.Tensor:
         """C8 decode: FIA BNSD with native paged INT8 KV + per-channel antiquant (mode=0)."""

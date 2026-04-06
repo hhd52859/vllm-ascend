@@ -1831,7 +1831,7 @@ class NPUModelRunner(GPUModelRunner):
         ):
             assert positions is not None
             update_full_graph_params(
-                self.attn_backend,
+                self._resolve_full_graph_attn_backend(),
                 self.update_stream,
                 forward_context,
                 num_tokens_padded,
@@ -3207,6 +3207,26 @@ class NPUModelRunner(GPUModelRunner):
 
         # Calculate reorder batch threshold (if needed)
         self.calculate_reorder_batch_threshold()
+
+    def _resolve_full_graph_attn_backend(self) -> type[AttentionBackend]:
+        """Pick the effective backend used by full-graph replay.
+
+        Full-graph attention update dispatch is backend-class based. When all
+        attention groups resolve to the same backend (the common dense-attention
+        case for MiniMax M2.5), prefer that backend over the runner-global
+        default selected before per-layer quantization overrides are applied.
+        """
+
+        attn_backends = list(dict.fromkeys(group.backend for group in self._attn_group_iterator()))
+        if len(attn_backends) == 1:
+            return attn_backends[0]
+
+        if len(attn_backends) > 1 and self.compilation_config.cudagraph_mode.has_full_cudagraphs():
+            logger.warning_once(
+                "ACL full-graph replay found multiple attention backends; "
+                "falling back to runner-global backend dispatch."
+            )
+        return self.attn_backend
 
     def calculate_reorder_batch_threshold(self) -> None:
         """

@@ -63,6 +63,24 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         if super().needs_capture():
             set_graph_params(self.capture_sizes)
 
+    def _resolve_full_graph_attn_backend(self):
+        attn_backends = getattr(self.model_runner, "attn_backends", None)
+        if attn_backends:
+            resolved_backends = list(dict.fromkeys(attn_backends.values()))
+        else:
+            resolved_backends = list(
+                dict.fromkeys(group.backend for group_list in self.model_runner.attn_groups for group in group_list)
+            )
+
+        if len(resolved_backends) == 1:
+            return resolved_backends[0]
+
+        logger.warning_once(
+            "ACL full-graph replay found multiple attention backends; "
+            "falling back to the first backend in capture order."
+        )
+        return resolved_backends[0]
+
     def run_fullgraph(self, desc: BatchExecutionDescriptor) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """Override run_fullgraph to update full graph params in run_fullgraph."""
         num_tokens = desc.num_tokens
@@ -84,8 +102,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         ):
             forward_context = get_forward_context()
             update_full_graph_params(
-                # FIXME(Ronald1995): support hybrid attn backend
-                list(self.model_runner.attn_backends.values())[0],
+                self._resolve_full_graph_attn_backend(),
                 self.model_runner.update_stream,
                 forward_context,
                 num_tokens,
